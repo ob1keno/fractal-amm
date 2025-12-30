@@ -81,24 +81,34 @@ class FractalLayer:
     def execute_trade(self, input_x: float = 0, input_y: float = 0) -> Tuple[float, float]:
         """
         Исполняет сделку и обновляет резервы.
+        Возвращает максимально возможный вывод для данного входа.
         
         Returns:
-            Tuple[output, input_used]: То же, что и get_output_for_input
+            Tuple[output, input_used]: Выходное количество и фактически использованный вход
         """
-        output, input_used = self.get_output_for_input(input_x, input_y)
+        if input_x > 0 and input_y > 0:
+            raise ValueError("Only one-sided trades are supported")
         
-        if output > 0:
+        # Рассчитываем максимальный возможный вывод
+        max_output, max_input = self.get_output_for_input(input_x, input_y)
+        
+        if max_output > 0:
+            # Используем расчётное количество, а не весь input
+            actual_input = max_input
+            
             if input_x > 0:  # Покупаем Y за X
-                input_after_fee = input_x * (1 - self.fee)
+                input_after_fee = actual_input * (1 - self.fee)
                 self.x_reserves += input_after_fee
-                self.y_reserves -= output
+                self.y_reserves -= max_output
+                return max_output, actual_input
+            
             elif input_y > 0:  # Покупаем X за Y
-                input_after_fee = input_y * (1 - self.fee)
+                input_after_fee = actual_input * (1 - self.fee)
                 self.y_reserves += input_after_fee
-                self.x_reserves -= output
+                self.x_reserves -= max_output
+                return max_output, actual_input
         
-        return output, input_used
-
+        return 0.0, 0.0
 
 class FractalAMM:
     """
@@ -123,22 +133,10 @@ class FractalAMM:
         for layer, (init_x, init_y) in zip(self.layers, self._initial_state):
             layer.x_reserves, layer.y_reserves = init_x, init_y
     
-    @property
-    def total_reserves(self) -> Tuple[float, float]:
-        """Суммарные резервы по всем слоям."""
-        total_x = sum(l.x_reserves for l in self.layers)
-        total_y = sum(l.y_reserves for l in self.layers)
-        return total_x, total_y
-    
     def trade_x_for_y(self, input_x: float) -> Dict:
         """
-        Покупка токена Y за токен X.
-        
-        Args:
-            input_x: Количество токена X для обмена
-            
-        Returns:
-            Dict с результатами торговли
+        Покупка токена Y за токен X с распределением по слоям.
+        Теперь каждый слой может исполнить только ЧАСТЬ ордера.
         """
         if input_x <= 0:
             raise ValueError("Input amount must be positive")
@@ -148,25 +146,45 @@ class FractalAMM:
         execution_details = []
         
         for layer in self.layers:
-            if remaining_x <= 1e-12:  # Практически ноль
+            if remaining_x <= 1e-12:
                 break
             
-            output_y, x_used = layer.execute_trade(input_x=remaining_x)
+            # Рассчитываем, сколько МОЖНО исполнить в этом слое
+            # Но исполняем только РАЗУМНУЮ часть
+            max_possible_output, required_x = layer.get_output_for_input(input_x=remaining_x)
             
-            if output_y > 0:
-                total_output_y += output_y
-                remaining_x -= x_used
+            if max_possible_output > 0 and required_x > 0:
+                # Ключевое изменение: ограничиваем, сколько X можно потратить в одном слое
+                # Например, не более 50% от оставшегося объема или фиксированный лимит
                 
-                execution_details.append({
-                    'layer': layer.name,
-                    'output_y': output_y,
-                    'x_used': x_used,
-                    'fee': layer.fee,
-                    'spot_price': layer.spot_price,
-                    'remaining_reserves': (layer.x_reserves, layer.y_reserves)
-                })
+                # Способ 1: Процент от оставшегося
+                max_x_in_this_layer = remaining_x * 0.3  # Не более 30% в одном слое
+                
+                # Способ 2: Абсолютный лимит на основе ёмкости слоя
+                # max_x_in_this_layer = min(remaining_x, layer.x_reserves * 0.5)
+                
+                # Исполняем ОГРАНИЧЕННЫЙ объем
+                actual_output, actual_x_used = layer.execute_trade(input_x=max_x_in_this_layer)
+                
+                if actual_output > 0:
+                    total_output_y += actual_output
+                    remaining_x -= actual_x_used
+                    
+                    execution_details.append({
+                        'layer': layer.name,
+                        'output_y': actual_output,
+                        'x_used': actual_x_used,
+                        'fee': layer.fee,
+                        'spot_price': layer.spot_price,
+                        'remaining_reserves': (layer.x_reserves, layer.y_reserves)
+                    })
         
         effective_price = total_output_y / input_x if input_x > 0 else 0.0
+        
+        # Если что-то осталось, пробуем исполнить остаток (рекурсивно)
+        if remaining_x > input_x * 0.01:  # Если осталось более 1%
+            # Можно добавить логику для исполнения остатка
+            pass
         
         return {
             'input_x': input_x,
@@ -176,54 +194,7 @@ class FractalAMM:
             'execution_details': execution_details,
             'success': total_output_y > 0
         }
-    
-    def trade_y_for_x(self, input_y: float) -> Dict:
-        """
-        Покупка токена X за токен Y.
-        
-        Args:
-            input_y: Количество токена Y для обмена
-            
-        Returns:
-            Dict с результатами торговли
-        """
-        if input_y <= 0:
-            raise ValueError("Input amount must be positive")
-        
-        remaining_y = input_y
-        total_output_x = 0.0
-        execution_details = []
-        
-        for layer in self.layers:
-            if remaining_y <= 1e-12:
-                break
-            
-            output_x, y_used = layer.execute_trade(input_y=remaining_y)
-            
-            if output_x > 0:
-                total_output_x += output_x
-                remaining_y -= y_used
-                
-                execution_details.append({
-                    'layer': layer.name,
-                    'output_x': output_x,
-                    'y_used': y_used,
-                    'fee': layer.fee,
-                    'spot_price': layer.spot_price,
-                    'remaining_reserves': (layer.x_reserves, layer.y_reserves)
-                })
-        
-        effective_price = total_output_x / input_y if input_y > 0 else 0.0
-        
-        return {
-            'input_y': input_y,
-            'output_x': total_output_x,
-            'effective_price': effective_price,
-            'remaining_y': remaining_y,
-            'execution_details': execution_details,
-            'success': total_output_x > 0
-        }
-    
+
     def analyze_trade_range(self, 
                            min_amount: float = 10, 
                            max_amount: float = 10000, 
