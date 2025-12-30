@@ -1,4 +1,4 @@
-# Создайте README.md
+
 @"
 # 🌀 Fractal AMM - Advanced MEV Protection System
 
